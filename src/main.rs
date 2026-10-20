@@ -1,18 +1,4 @@
 //! P2P Room: a tiny "anyone can host" chat, drawn as a node graph in the terminal.
-//!
-//! Topology (like an old listen-server): one player hosts, everyone else joins.
-//! Every client talks to the host, and the host relays messages between clients.
-//!
-//! Wire protocol: one UTF-8 line per frame, fields separated by TAB.
-//! Names and message text are sanitized so they can never contain TAB/newline.
-//!
-//!   client -> host   HELLO\t<name>
-//!                    MSG\t<to_id>\t<text>        (to_id 0 = host, u32::MAX = everyone)
-//!   host   -> client WELCOME\t<your_id>\t<host_name>
-//!                    JOIN\t<id>\t<name>
-//!                    LEAVE\t<id>
-//!                    MSG\t<from_id>\t<text>
-//!                    ERR\t<reason>
 
 use crossterm::{
     cursor::Show,
@@ -31,9 +17,9 @@ use ratatui::{
     },
     Frame, Terminal,
 };
+use rusqlite::{params, Connection};
 use std::{
     collections::BTreeMap,
-    fs::{OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{
@@ -63,11 +49,11 @@ const BROADCAST_ID: u32 = u32::MAX;
 
 const NET_TIMEOUT: Duration = Duration::from_secs(5);
 
-const WORD_STAGGER: f32 = 0.15; // seconds between words leaving the node
-const WORD_FLIGHT: f32 = 0.9; // seconds one word needs to cross the link
+const WORD_STAGGER: f32 = 0.15;
+const WORD_FLIGHT: f32 = 0.9;
 const MAX_FLYING_WORDS: usize = 6;
 
-const HISTORY_FILE: &str = "p2p_chat_history.txt";
+const DB_FILE: &str = "p2p_chat_history.db";
 
 // ───────────────────────────── small helpers ─────────────────────────────
 
@@ -75,7 +61,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Display width of one char (handles wide/zero-width chars).
 fn cw(c: char) -> usize {
     Span::raw(c.to_string()).width()
 }
@@ -84,7 +69,6 @@ fn text_width(s: &str) -> usize {
     s.chars().map(cw).sum()
 }
 
-/// Replace control chars (incl. TAB/newline) with spaces, trim, cap length.
 fn sanitize(s: &str, max_chars: usize) -> String {
     let cleaned: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     cleaned.trim().chars().take(max_chars).collect::<String>().trim_end().to_string()
@@ -97,6 +81,11 @@ fn display_name(raw: &str) -> String {
     } else {
         n
     }
+}
+
+fn encrypt_decrypt(data: &str) -> String {
+    let key: u8 = 0x5A;
+    data.bytes().map(|b| (b ^ key) as char).collect()
 }
 
 fn truncate(s: &str, max_w: usize) -> String {
@@ -117,7 +106,6 @@ fn truncate(s: &str, max_w: usize) -> String {
     out
 }
 
-/// Keep the *end* of `s` so that it fits in `max_w` columns (for the input box).
 fn tail_fit(s: &str, max_w: usize) -> String {
     let mut w = 0;
     let mut out: Vec<char> = Vec::new();
@@ -180,7 +168,17 @@ fn lan_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-// ───────────────────────────── persistence ─────────────────────────────
+fn generate_crypto_avatar(uuid: &str) -> String {
+    let mut hash: u32 = 0;
+    for b in uuid.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    let shapes = ['■', '▲', '◆', '●', '★', '◈', '◢', '▰'];
+    let shape = shapes[(hash as usize) % shapes.len()];
+    format!("[{}{:04X}]", shape, hash & 0xFFFF)
+}
+
+// ───────────────────────────── persistence (SQLite) ─────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -194,33 +192,51 @@ struct LogEntry {
     text: String,
 }
 
+fn init_db() -> rusqlite::Result<Connection> {
+    let conn = Connection::open(DB_FILE)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS history (
+            peer_name TEXT,
+            kind TEXT,
+            text TEXT
+        )",
+        [],
+    )?;
+    Ok(conn)
+}
+
 fn save_history_entry(peer_name: &str, kind: Kind, text: &str) {
-    let kind_str = match kind {
-        Kind::In => "IN",
-        Kind::Out => "OUT",
-        Kind::Sys => "SYS",
-    };
-    let clean_text = text.replace('\t', " ");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(HISTORY_FILE) {
-        let _ = writeln!(file, "{}\t{}\t{}", peer_name, kind_str, clean_text);
+    if let Ok(conn) = init_db() {
+        let kind_str = match kind {
+            Kind::In => "IN",
+            Kind::Out => "OUT",
+            Kind::Sys => "SYS",
+        };
+        let encrypted_text = encrypt_decrypt(text);
+        let _ = conn.execute(
+            "INSERT INTO history (peer_name, kind, text) VALUES (?1, ?2, ?3)",
+            params![peer_name, kind_str, encrypted_text],
+        );
     }
 }
 
 fn load_history_for(peer_name: &str) -> Vec<LogEntry> {
     let mut logs = Vec::new();
-    if let Ok(file) = std::fs::File::open(HISTORY_FILE) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            let mut parts = line.splitn(3, '\t');
-            if let (Some(name), Some(k_str), Some(txt)) = (parts.next(), parts.next(), parts.next()) {
-                if name == peer_name {
-                    let kind = match k_str {
-                        "IN" => Kind::In,
-                        "OUT" => Kind::Out,
-                        _ => Kind::Sys,
-                    };
-                    logs.push(LogEntry { kind, text: txt.to_string() });
-                }
+    if let Ok(conn) = init_db() {
+        let mut stmt = conn.prepare("SELECT kind, text FROM history WHERE peer_name = ?1").unwrap();
+        let rows = stmt.query_map(params![peer_name], |row| {
+            let k_str: String = row.get(0)?;
+            let enc_txt: String = row.get(1)?;
+            Ok((k_str, encrypt_decrypt(&enc_txt)))
+        });
+        if let Ok(iter) = rows {
+            for r in iter.flatten() {
+                let kind = match r.0.as_str() {
+                    "IN" => Kind::In,
+                    "OUT" => Kind::Out,
+                    _ => Kind::Sys,
+                };
+                logs.push(LogEntry { kind, text: r.1 });
             }
         }
     }
@@ -233,7 +249,7 @@ fn load_history_for(peer_name: &str) -> Vec<LogEntry> {
 // ───────────────────────────── networking ─────────────────────────────
 
 enum NetEvent {
-    PeerJoined { id: u32, name: String },
+    PeerJoined { id: u32, name: String, uuid: String },
     PeerLeft { id: u32 },
     Message { from: u32, text: String },
     Disconnected(String),
@@ -270,6 +286,7 @@ fn spawn_writer(mut stream: TcpStream, rx: Receiver<String>) {
 
 struct ClientHandle {
     name: String,
+    uuid: String,
     tx: Sender<String>,
 }
 type Hub = Arc<Mutex<BTreeMap<u32, ClientHandle>>>;
@@ -291,7 +308,7 @@ impl HostHandle {
     }
 }
 
-fn start_host(bind: &str, host_name: String, ui_tx: Sender<NetEvent>) -> io::Result<HostHandle> {
+fn start_host(bind: &str, host_name: String, host_uuid: String, room_pwd: String, ui_tx: Sender<NetEvent>) -> io::Result<HostHandle> {
     let listener = TcpListener::bind(bind)?;
     let local_addr = listener.local_addr()?;
     let hub: Hub = Arc::new(Mutex::new(BTreeMap::new()));
@@ -303,8 +320,8 @@ fn start_host(bind: &str, host_name: String, ui_tx: Sender<NetEvent>) -> io::Res
             match conn {
                 Ok(stream) => {
                     let (hub, next_id) = (accept_hub.clone(), next_id.clone());
-                    let (name, tx) = (host_name.clone(), ui_tx.clone());
-                    thread::spawn(move || handle_client(stream, hub, next_id, name, tx));
+                    let (name, uuid, pwd, tx) = (host_name.clone(), host_uuid.clone(), room_pwd.clone(), ui_tx.clone());
+                    thread::spawn(move || handle_client(stream, hub, next_id, name, uuid, pwd, tx));
                 }
                 Err(_) => thread::sleep(Duration::from_millis(100)),
             }
@@ -319,6 +336,8 @@ fn handle_client(
     hub: Hub,
     next_id: Arc<AtomicU32>,
     host_name: String,
+    host_uuid: String,
+    room_pwd: String,
     ui_tx: Sender<NetEvent>,
 ) {
     let _ = stream.set_nodelay(true);
@@ -330,9 +349,19 @@ fn handle_client(
     if !matches!(read_frame(&mut reader, &mut line), Ok(true)) {
         return;
     }
-    let Some(raw_name) = line.strip_prefix("HELLO\t") else { return };
-    let name = display_name(raw_name);
+    let Some(rest) = line.strip_prefix("HELLO\t") else { return };
+    let mut parts = rest.splitn(3, '\t');
+    let raw_name = parts.next().unwrap_or("Anonymous");
+    let client_uuid = parts.next().unwrap_or("unknown-uuid");
+    let client_pwd = parts.next().unwrap_or("");
 
+    if !room_pwd.is_empty() && client_pwd != room_pwd {
+        let mut w = write_half;
+        let _ = w.write_all(b"ERR\tIncorrect Room Password\n");
+        return;
+    }
+
+    let name = display_name(raw_name);
     let (tx, rx) = mpsc::channel::<String>();
     spawn_writer(write_half, rx);
 
@@ -343,17 +372,17 @@ fn handle_client(
             return;
         }
         let id = next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = tx.send(format!("WELCOME\t{id}\t{host_name}"));
+        let _ = tx.send(format!("WELCOME\t{id}\t{host_name}\t{host_uuid}"));
         for (eid, e) in clients.iter() {
-            let _ = tx.send(format!("JOIN\t{eid}\t{}", e.name));
+            let _ = tx.send(format!("JOIN\t{eid}\t{}\t{}", e.name, e.uuid));
         }
         for e in clients.values() {
-            let _ = e.tx.send(format!("JOIN\t{id}\t{name}"));
+            let _ = e.tx.send(format!("JOIN\t{id}\t{name}\t{client_uuid}"));
         }
-        clients.insert(id, ClientHandle { name: name.clone(), tx: tx.clone() });
+        clients.insert(id, ClientHandle { name: name.clone(), uuid: client_uuid.to_string(), tx: tx.clone() });
         id
     };
-    let _ = ui_tx.send(NetEvent::PeerJoined { id, name });
+    let _ = ui_tx.send(NetEvent::PeerJoined { id, name, uuid: client_uuid.to_string() });
     let _ = reader.get_ref().set_read_timeout(None);
 
     while matches!(read_frame(&mut reader, &mut line), Ok(true)) {
@@ -402,9 +431,10 @@ struct ClientLink {
     tx: Sender<String>,
     my_id: u32,
     server_name: String,
+    server_uuid: String,
 }
 
-fn connect_client(addr: &str, my_name: &str, ui_tx: Sender<NetEvent>) -> Result<ClientLink, String> {
+fn connect_client(addr: &str, my_name: &str, my_uuid: &str, room_pwd: &str, ui_tx: Sender<NetEvent>) -> Result<ClientLink, String> {
     let sock_addr = addr
         .to_socket_addrs()
         .map_err(|e| format!("Bad address '{addr}': {e}"))?
@@ -418,7 +448,7 @@ fn connect_client(addr: &str, my_name: &str, ui_tx: Sender<NetEvent>) -> Result<
 
     let (tx, rx) = mpsc::channel::<String>();
     spawn_writer(write_half, rx);
-    let _ = tx.send(format!("HELLO\t{my_name}"));
+    let _ = tx.send(format!("HELLO\t{}\t{}\t{}", my_name, my_uuid, room_pwd));
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -428,9 +458,12 @@ fn connect_client(addr: &str, my_name: &str, ui_tx: Sender<NetEvent>) -> Result<
         Err(e) => return Err(format!("No valid reply from server: {e}")),
     }
     let bad = || "That does not look like a P2P Room server".to_string();
-    let (my_id, server_name) = if let Some(rest) = line.strip_prefix("WELCOME\t") {
-        let (id, name) = rest.split_once('\t').ok_or_else(bad)?;
-        (id.parse::<u32>().map_err(|_| bad())?, display_name(name))
+    let (my_id, server_name, server_uuid) = if let Some(rest) = line.strip_prefix("WELCOME\t") {
+        let mut parts = rest.splitn(3, '\t');
+        let id = parts.next().ok_or_else(bad)?;
+        let name = parts.next().ok_or_else(bad)?;
+        let uuid = parts.next().unwrap_or("server-uuid");
+        (id.parse::<u32>().map_err(|_| bad())?, display_name(name), uuid.to_string())
     } else if let Some(reason) = line.strip_prefix("ERR\t") {
         return Err(sanitize(reason, 80));
     } else {
@@ -439,7 +472,7 @@ fn connect_client(addr: &str, my_name: &str, ui_tx: Sender<NetEvent>) -> Result<
 
     let _ = reader.get_ref().set_read_timeout(None);
     thread::spawn(move || client_reader(reader, ui_tx));
-    Ok(ClientLink { tx, my_id, server_name })
+    Ok(ClientLink { tx, my_id, server_name, server_uuid })
 }
 
 fn client_reader(mut reader: BufReader<TcpStream>, ui_tx: Sender<NetEvent>) {
@@ -454,18 +487,18 @@ fn client_reader(mut reader: BufReader<TcpStream>, ui_tx: Sender<NetEvent>) {
                 break;
             }
         }
-        let mut parts = line.splitn(3, '\t');
-        let event = match (parts.next(), parts.next(), parts.next()) {
-            (Some("JOIN"), Some(id), Some(name)) => id
+        let mut parts = line.splitn(4, '\t');
+        let event = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some("JOIN"), Some(id), Some(name), Some(uuid)) => id
                 .parse()
                 .ok()
-                .map(|id| NetEvent::PeerJoined { id, name: display_name(name) }),
-            (Some("LEAVE"), Some(id), _) => id.parse().ok().map(|id| NetEvent::PeerLeft { id }),
-            (Some("MSG"), Some(from), Some(text)) => from
+                .map(|id| NetEvent::PeerJoined { id, name: display_name(name), uuid: uuid.to_string() }),
+            (Some("LEAVE"), Some(id), _, _) => id.parse().ok().map(|id| NetEvent::PeerLeft { id }),
+            (Some("MSG"), Some(from), Some(text), _) => from
                 .parse()
                 .ok()
                 .map(|from| NetEvent::Message { from, text: sanitize(text, MAX_TEXT_CHARS) }),
-            (Some("ERR"), Some(r), _) => {
+            (Some("ERR"), Some(r), _, _) => {
                 reason = sanitize(r, 80);
                 break;
             }
@@ -490,14 +523,15 @@ enum Screen {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
-    Host,
     Join,
+    Host,
 }
 
 struct Wizard {
     mode: Mode,
     name: String,
     addr: String,
+    password: String,
     field: usize,
     error: Option<String>,
 }
@@ -505,23 +539,27 @@ struct Wizard {
 struct Peer {
     id: u32,
     name: String,
+    uuid: String,
     manual: Option<(f32, f32)>,
     log: Vec<LogEntry>,
     total: usize,
     unread: usize,
+    scroll_offset: usize,
 }
 
 impl Peer {
-    fn new(id: u32, name: String) -> Self {
+    fn new(id: u32, name: String, uuid: String) -> Self {
         let log = load_history_for(&name);
         let total = log.iter().filter(|e| e.kind != Kind::Sys).count();
         Self {
             id,
             name,
+            uuid,
             manual: None,
             log,
             total,
             unread: 0,
+            scroll_offset: 0,
         }
     }
 }
@@ -562,6 +600,7 @@ struct App {
     wizard: Wizard,
     should_quit: bool,
     name: String,
+    uuid: String,
     is_host: bool,
     peers: Vec<Peer>,
     selected: usize,
@@ -575,7 +614,6 @@ struct App {
     lan: IpAddr,
     status: Option<(String, Instant)>,
     free_range: (f32, f32),
-    // Hit-testing state for mouse clicks
     last_peer_rects: Vec<(u32, Rect)>,
 }
 
@@ -609,18 +647,21 @@ fn auto_ratio(i: usize, n: usize, fx: f32, fy: f32) -> (f32, f32) {
 impl App {
     fn new() -> Self {
         let (ui_tx, ui_rx) = mpsc::channel();
+        let my_uuid = uuid::Uuid::new_v4().to_string();
         Self {
             screen: Screen::Wizard,
             wizard: Wizard {
-                mode: Mode::Host,
+                mode: Mode::Join,
                 name: "Player-One".to_string(),
-                addr: "8001".to_string(),
+                addr: "127.0.0.1:8001".to_string(),
+                password: "".to_string(),
                 field: 0,
                 error: None,
             },
             should_quit: false,
             name: String::new(),
-            is_host: true,
+            uuid: my_uuid,
+            is_host: false,
             peers: Vec::new(),
             selected: 0,
             input: String::new(),
@@ -653,11 +694,13 @@ impl App {
         }
         self.selected = idx % self.peers.len();
         self.peers[self.selected].unread = 0;
+        self.peers[self.selected].scroll_offset = 0;
     }
 
     fn start_session(&mut self) -> Result<(), String> {
         let name = display_name(&self.wizard.name);
         let addr = self.wizard.addr.trim().to_string();
+        let password = self.wizard.password.trim().to_string();
         let is_host = self.wizard.mode == Mode::Host;
 
         if is_host {
@@ -667,17 +710,22 @@ impl App {
                 let port: u16 = addr.parse().map_err(|_| "Port must be a number (or use ip:port)".to_string())?;
                 format!("0.0.0.0:{port}")
             };
-            let host = start_host(&bind, name.clone(), self.ui_tx.clone())
+            let host = start_host(&bind, name.clone(), self.uuid.clone(), password, self.ui_tx.clone())
                 .map_err(|e| format!("Cannot host on {bind}: {e}"))?;
             self.room_info = format!("friends join: {}:{}", self.lan, host.local_addr.port());
             self.link = Link::Host(host);
             self.my_id = SERVER_ID;
         } else {
             let target = if addr.contains(':') { addr } else { format!("127.0.0.1:{addr}") };
-            let link = connect_client(&target, &name, self.ui_tx.clone())?;
+            let link = connect_client(&target, &name, &self.uuid, &password, self.ui_tx.clone())?;
             self.room_info = format!("server: {target}");
             self.my_id = link.my_id;
-            self.peers.push(Peer::new(SERVER_ID, link.server_name.clone()));
+            
+            // Extract fields before moving link into Link::Client to fix E0382
+            let s_name = link.server_name.clone();
+            let s_uuid = link.server_uuid.clone();
+
+            self.peers.push(Peer::new(SERVER_ID, s_name, s_uuid));
             self.link = Link::Client(link);
         }
 
@@ -729,8 +777,8 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Esc => self.should_quit = true,
-            KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 2) % 3,
+            KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 4,
+            KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 3) % 4,
             KeyCode::Left | KeyCode::Right if w.field == 0 => {
                 w.mode = if w.mode == Mode::Host { Mode::Join } else { Mode::Host };
                 w.addr = if w.mode == Mode::Host { "8001" } else { "127.0.0.1:8001" }.to_string();
@@ -743,11 +791,13 @@ impl App {
             KeyCode::Char(c) if (!ctrl || alt) && !c.is_control() => match w.field {
                 1 if w.name.chars().count() < MAX_NAME_CHARS => w.name.push(c),
                 2 if w.addr.chars().count() < 64 => w.addr.push(c),
+                3 if w.password.chars().count() < 32 => w.password.push(c),
                 _ => {}
             },
             KeyCode::Backspace => match w.field {
                 1 => { w.name.pop(); }
                 2 => { w.addr.pop(); }
+                3 => { w.password.pop(); }
                 _ => {}
             },
             _ => {}
@@ -784,6 +834,16 @@ impl App {
         match key.code {
             KeyCode::Tab | KeyCode::Right => self.select(self.selected + 1),
             KeyCode::BackTab | KeyCode::Left => self.select(self.selected + self.peers.len().saturating_sub(1)),
+            KeyCode::Up => {
+                if let Some(p) = self.peers.get_mut(self.selected) {
+                    p.scroll_offset = p.scroll_offset.saturating_add(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = self.peers.get_mut(self.selected) {
+                    p.scroll_offset = p.scroll_offset.saturating_sub(1);
+                }
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Char(c) if !c.is_control() => self.push_input(c),
             KeyCode::Backspace => {
@@ -860,12 +920,12 @@ impl App {
     fn poll_network(&mut self) {
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
-                NetEvent::PeerJoined { id, name } => {
+                NetEvent::PeerJoined { id, name, uuid } => {
                     if (id == self.my_id && !self.is_host) || self.peers.iter().any(|p| p.id == id) {
                         continue;
                     }
                     self.set_status(format!("{name} joined"));
-                    self.peers.push(Peer::new(id, name));
+                    self.peers.push(Peer::new(id, name, uuid));
                 }
                 NetEvent::PeerLeft { id } => {
                     if let Some(idx) = self.peers.iter().position(|p| p.id == id) {
@@ -1089,6 +1149,7 @@ fn draw_wizard(f: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
+        Constraint::Length(3),
         Constraint::Min(2),
     ])
     .margin(3)
@@ -1111,10 +1172,12 @@ fn draw_wizard(f: &mut Frame, app: &App) {
     };
 
     let mode_str = if w.mode == Mode::Host { "[ Host Server ]" } else { "[ Join Server ]" };
+    let avatar_str = generate_crypto_avatar(&app.uuid);
     field(f, layout[0], format!(" Mode: {mode_str} (Left/Right to toggle)"), 0);
-    field(f, layout[1], format!(" Player Name: {}_", w.name), 1);
+    field(f, layout[1], format!(" Player Name: {}_  | Crypto ID: {avatar_str}", w.name), 1);
     let label = if w.mode == Mode::Host { "Listen Port" } else { "Server Address (IP:Port)" };
     field(f, layout[2], format!(" {label}: {}_", w.addr), 2);
+    field(f, layout[3], format!(" Optional Password: {}_", w.password), 3);
 
     let mut lines: Vec<TextLine> = Vec::new();
     if let Some(err) = &w.error {
@@ -1125,7 +1188,7 @@ fn draw_wizard(f: &mut Frame, app: &App) {
         lines.push(TextLine::from(""));
     }
     lines.push(TextLine::from(" [Tab/Up/Down] Navigate | [Left/Right] Toggle | [Enter] Start | [Esc] Quit"));
-    f.render_widget(Paragraph::new(lines), layout[3]);
+    f.render_widget(Paragraph::new(lines), layout[4]);
 }
 
 fn draw_chat(f: &mut Frame, app: &mut App) {
@@ -1146,15 +1209,15 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     app.free_range = geo.free;
     app.clamp_selection();
 
-    // Cache rects for mouse hit-testing
     app.last_peer_rects = app.peers.iter().zip(&geo.peers).map(|(p, r)| (p.id, *r)).collect();
 
     let role = if app.is_host { "HOST" } else { "CLIENT" };
     f.render_widget(
         Block::default()
             .title(format!(
-                " Room [{role}] {} | {} | Peers: {} ",
+                " Room [{role}] {} ({}) | {} | Peers: {} ",
                 app.name,
+                generate_crypto_avatar(&app.uuid),
                 app.room_info,
                 app.peers.len()
             ))
@@ -1218,9 +1281,10 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         f,
         geo.local,
         &format!("{} (You)", app.name),
-        vec![TextLine::from(format!("Role: {role}")), TextLine::from("Status: Online")],
-        Color::Gray,
+        vec![TextLine::from(format!("Avatar: {}", generate_crypto_avatar(&app.uuid))), TextLine::from(format!("Role: {role}"))],
+        Color::Yellow,
     );
+
     for (i, peer) in app.peers.iter().enumerate() {
         let color = if i == app.selected { Color::Yellow } else { Color::DarkGray };
         let msgs = if peer.unread > 0 {
@@ -1228,8 +1292,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         } else {
             format!("Msgs: {}", peer.total)
         };
-        let role = if peer.id == SERVER_ID { "Role: Host" } else { "Role: Player" };
-        draw_node(f, geo.peers[i], &peer.name, vec![TextLine::from(role), TextLine::from(msgs)], color);
+        draw_node(f, geo.peers[i], &peer.name, vec![TextLine::from(generate_crypto_avatar(&peer.uuid)), TextLine::from(msgs)], color);
     }
 
     if let Some(peer) = app.peers.get(app.selected) {
@@ -1237,7 +1300,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         let rect = place_bubble(app.selected, size, inner, geo.local, &geo.peers);
         f.render_widget(Clear, rect);
         let block = Block::default()
-            .title(format!(" Log: {} ", truncate(&peer.name, 20)))
+            .title(format!(" Log: {} {} ", truncate(&peer.name, 12), generate_crypto_avatar(&peer.uuid)))
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::Yellow));
         let (text_w, text_h) = (rect.width.saturating_sub(2) as usize, rect.height.saturating_sub(2) as usize);
@@ -1268,10 +1331,15 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
                 push(if fl.incoming { Kind::In } else { Kind::Out }, format!("{tag}: {} ...", fl.words[..n].join(" ")));
             }
         }
-        let skip = rows.len().saturating_sub(text_h);
+        
+        let max_scroll = rows.len().saturating_sub(text_h);
+        let scroll = peer.scroll_offset.min(max_scroll);
+        let skip = max_scroll.saturating_sub(scroll);
+
         let lines: Vec<TextLine> = rows
             .into_iter()
             .skip(skip)
+            .take(text_h)
             .map(|(c, t)| TextLine::from(Span::styled(t, Style::default().fg(c))))
             .collect();
         f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -1304,7 +1372,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
             Span::styled(format!(" {msg}"), Style::default().fg(Color::Yellow))
         }
         _ => Span::styled(
-            " Tab/Click: select | Alt+Arrows: move node | /all <msg>: everyone | Esc: quit",
+            " Tab/Click: select | Up/Down: scroll log | Alt+Arrows: move node | /all <msg>: everyone",
             Style::default().fg(Color::DarkGray),
         ),
     };
