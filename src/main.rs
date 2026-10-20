@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -67,7 +67,30 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyCode) {
+    fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        // If Ctrl is held, move the currently targeted peer node position
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            let step = 0.03;
+            let peer = &mut self.peers[self.selected_peer];
+            match key {
+                KeyCode::Left => {
+                    peer.x_ratio = (peer.x_ratio - step).max(0.05);
+                }
+                KeyCode::Right => {
+                    peer.x_ratio = (peer.x_ratio + step).min(0.90);
+                }
+                KeyCode::Up => {
+                    peer.y_ratio = (peer.y_ratio - step).max(0.05);
+                }
+                KeyCode::Down => {
+                    peer.y_ratio = (peer.y_ratio + step).min(0.85);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Standard key controls
         match key {
             KeyCode::Tab => {
                 self.selected_peer += 1;
@@ -117,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
 
     while !app.should_quit {
-        // Tick active flight animations smoothly
+        // Tick active flight animations smoothly (slower speed at 0.025)
         app.animations.retain_mut(|anim| {
             anim.progress += 0.025;
             if anim.progress >= 1.0 {
@@ -141,9 +164,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let canvas_area = vertical_chunks[0];
             let input_area = vertical_chunks[1];
 
-            // Canvas border block
+            // Canvas border block with updated instructions
             let canvas_block = Block::default()
-                .title(" P2P Network Graph [Tab: Switch Peer | Enter: Send | Esc: Quit] ")
+                .title(" P2P Network Graph [Tab: Switch Peer | Ctrl+Arrows: Move Node | Enter: Send | Esc: Quit] ")
                 .borders(Borders::ALL)
                 .style(Style::default().fg(Color::Cyan));
 
@@ -180,7 +203,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let canvas_height = inner_canvas_area.height;
             let active_target = app.selected_peer;
             
-            // Clone lightweight data needed inside the canvas closure to avoid borrow checker errors
             let canvas_node_positions = node_positions.clone();
             let canvas_animations: Vec<(usize, Vec<String>, f32)> = app
                 .animations
@@ -337,7 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(Duration::from_millis(30))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code);
+                    app.handle_key(key.code, key.modifiers);
                 }
             }
         }
