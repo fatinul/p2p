@@ -14,13 +14,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: p2p_room_linux
+            binary_name: p2p_linux
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: p2p_room.exe
+            binary_name: p2p.exe
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary_name: p2p_room_macos
+            binary_name: p2p_macos
 
     steps:
       - name: Checkout repository
@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          mv p2p_room* ${{ matrix.binary_name }}
+          mv p2p* ${{ matrix.binary_name }}
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
