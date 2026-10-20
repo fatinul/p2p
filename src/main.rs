@@ -16,7 +16,7 @@
 
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -33,6 +33,7 @@ use ratatui::{
 };
 use std::{
     collections::BTreeMap,
+    fs::{OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{
@@ -65,6 +66,8 @@ const NET_TIMEOUT: Duration = Duration::from_secs(5);
 const WORD_STAGGER: f32 = 0.15; // seconds between words leaving the node
 const WORD_FLIGHT: f32 = 0.9; // seconds one word needs to cross the link
 const MAX_FLYING_WORDS: usize = 6;
+
+const HISTORY_FILE: &str = "p2p_chat_history.txt";
 
 // ───────────────────────────── small helpers ─────────────────────────────
 
@@ -167,8 +170,6 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Best-effort LAN address so the host can tell friends what to type.
-/// (A UDP "connect" only selects a route; no packet is ever sent.)
 fn lan_ip() -> IpAddr {
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
@@ -177,6 +178,56 @@ fn lan_ip() -> IpAddr {
         })
         .map(|a| a.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+// ───────────────────────────── persistence ─────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    In,
+    Out,
+    Sys,
+}
+
+struct LogEntry {
+    kind: Kind,
+    text: String,
+}
+
+fn save_history_entry(peer_name: &str, kind: Kind, text: &str) {
+    let kind_str = match kind {
+        Kind::In => "IN",
+        Kind::Out => "OUT",
+        Kind::Sys => "SYS",
+    };
+    let clean_text = text.replace('\t', " ");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(HISTORY_FILE) {
+        let _ = writeln!(file, "{}\t{}\t{}", peer_name, kind_str, clean_text);
+    }
+}
+
+fn load_history_for(peer_name: &str) -> Vec<LogEntry> {
+    let mut logs = Vec::new();
+    if let Ok(file) = std::fs::File::open(HISTORY_FILE) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let mut parts = line.splitn(3, '\t');
+            if let (Some(name), Some(k_str), Some(txt)) = (parts.next(), parts.next(), parts.next()) {
+                if name == peer_name {
+                    let kind = match k_str {
+                        "IN" => Kind::In,
+                        "OUT" => Kind::Out,
+                        _ => Kind::Sys,
+                    };
+                    logs.push(LogEntry { kind, text: txt.to_string() });
+                }
+            }
+        }
+    }
+    if logs.is_empty() {
+        logs.push(LogEntry { kind: Kind::Sys, text: "Connected to room".to_string() });
+    }
+    logs
 }
 
 // ───────────────────────────── networking ─────────────────────────────
@@ -188,8 +239,6 @@ enum NetEvent {
     Disconnected(String),
 }
 
-/// Read one frame (line). Ok(false) = clean EOF. Lines are length-limited so a
-/// misbehaving peer cannot make us buffer unbounded data.
 fn read_frame<R: BufRead>(reader: &mut R, buf: &mut String) -> io::Result<bool> {
     buf.clear();
     let n = reader.by_ref().take(MAX_LINE_BYTES).read_line(buf)?;
@@ -205,9 +254,6 @@ fn read_frame<R: BufRead>(reader: &mut R, buf: &mut String) -> io::Result<bool> 
     Ok(true)
 }
 
-/// Every connection gets a dedicated writer thread fed by a channel, so a slow
-/// peer can never block the UI or the other peers. When the channel closes (or a
-/// write fails) the socket is shut down, which also wakes the reader thread.
 fn spawn_writer(mut stream: TcpStream, rx: Receiver<String>) {
     thread::spawn(move || {
         let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
@@ -234,7 +280,6 @@ struct HostHandle {
 }
 
 impl HostHandle {
-    /// Send a message from the host to one client (or all of them).
     fn send(&self, to: u32, text: &str) -> bool {
         let wire = format!("MSG\t{SERVER_ID}\t{text}");
         let clients = lock(&self.hub);
@@ -277,7 +322,7 @@ fn handle_client(
     ui_tx: Sender<NetEvent>,
 ) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(NET_TIMEOUT)); // handshake must be quick
+    let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
     let Ok(write_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -359,9 +404,6 @@ struct ClientLink {
     server_name: String,
 }
 
-/// Connect + handshake synchronously, so the wizard can show a real error
-/// ("connection refused", "room is full", "not a chat server") instead of
-/// silently opening an empty room.
 fn connect_client(addr: &str, my_name: &str, ui_tx: Sender<NetEvent>) -> Result<ClientLink, String> {
     let sock_addr = addr
         .to_socket_addrs()
@@ -456,27 +498,13 @@ struct Wizard {
     mode: Mode,
     name: String,
     addr: String,
-    color: usize,
     field: usize,
     error: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    In,
-    Out,
-    Sys,
-}
-
-struct LogEntry {
-    kind: Kind,
-    text: String,
 }
 
 struct Peer {
     id: u32,
     name: String,
-    /// Manual position as a ratio (0..1) of the free space; None = auto layout.
     manual: Option<(f32, f32)>,
     log: Vec<LogEntry>,
     total: usize,
@@ -484,20 +512,20 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(id: u32, name: String, note: &str) -> Self {
+    fn new(id: u32, name: String) -> Self {
+        let log = load_history_for(&name);
+        let total = log.iter().filter(|e| e.kind != Kind::Sys).count();
         Self {
             id,
             name,
             manual: None,
-            log: vec![LogEntry { kind: Kind::Sys, text: note.to_string() }],
-            total: 0,
+            log,
+            total,
             unread: 0,
         }
     }
 }
 
-/// A message "flying" along a link. Keyed by peer *id* (not index) so it stays
-/// correct when other peers join or leave mid-flight.
 struct Flight {
     peer_id: u32,
     full: String,
@@ -535,7 +563,6 @@ struct App {
     should_quit: bool,
     name: String,
     is_host: bool,
-    color: Color,
     peers: Vec<Peer>,
     selected: usize,
     input: String,
@@ -548,39 +575,31 @@ struct App {
     lan: IpAddr,
     status: Option<(String, Instant)>,
     free_range: (f32, f32),
+    // Hit-testing state for mouse clicks
+    last_peer_rects: Vec<(u32, Rect)>,
 }
 
-fn color_of(i: usize) -> Color {
-    [Color::Cyan, Color::Green, Color::Magenta, Color::Yellow][i % 4]
-}
-
-/// A point on the outline of the free area (fx x fy cells), walking clockwise from the
-/// right-middle. Returns ratios (0..1) of the free area.
 fn outline_point(s: f32, fx: f32, fy: f32) -> (f32, f32) {
     let mut s = s.rem_euclid(2.0 * (fx + fy));
     if s < fy / 2.0 {
-        return (1.0, 0.5 + s / fy); // right edge, going down
+        return (1.0, 0.5 + s / fy);
     }
     s -= fy / 2.0;
     if s < fx {
-        return (1.0 - s / fx, 1.0); // bottom edge, going left
+        return (1.0 - s / fx, 1.0);
     }
     s -= fx;
     if s < fy {
-        return (0.0, 1.0 - s / fy); // left edge, going up
+        return (0.0, 1.0 - s / fy);
     }
     s -= fy;
     if s < fx {
-        return (s / fx, 0.0); // top edge, going right
+        return (s / fx, 0.0);
     }
     s -= fx;
-    (1.0, s / fy) // right edge again, going down to the middle
+    (1.0, s / fy)
 }
 
-/// Default position of node `i` of `n`: evenly spaced along the outline of the free
-/// area, i.e. as far from "you" (in the middle) as possible, which keeps every link long
-/// enough to see. A single peer sits on the right, two sit left/right, odd counts put one
-/// node on top.
 fn auto_ratio(i: usize, n: usize, fx: f32, fy: f32) -> (f32, f32) {
     let (fx, fy) = (fx.max(1.0), fy.max(1.0));
     let start = if n > 1 && n % 2 == 1 { fy / 2.0 + fx + fy + fx / 2.0 } else { 0.0 };
@@ -596,14 +615,12 @@ impl App {
                 mode: Mode::Host,
                 name: "Player-One".to_string(),
                 addr: "8001".to_string(),
-                color: 0,
                 field: 0,
                 error: None,
             },
             should_quit: false,
             name: String::new(),
             is_host: true,
-            color: Color::Cyan,
             peers: Vec::new(),
             selected: 0,
             input: String::new(),
@@ -616,6 +633,7 @@ impl App {
             lan: lan_ip(),
             status: None,
             free_range: (1.0, 1.0),
+            last_peer_rects: Vec::new(),
         }
     }
 
@@ -636,8 +654,6 @@ impl App {
         self.selected = idx % self.peers.len();
         self.peers[self.selected].unread = 0;
     }
-
-    // ── session lifecycle ──
 
     fn start_session(&mut self) -> Result<(), String> {
         let name = display_name(&self.wizard.name);
@@ -661,13 +677,12 @@ impl App {
             let link = connect_client(&target, &name, self.ui_tx.clone())?;
             self.room_info = format!("server: {target}");
             self.my_id = link.my_id;
-            self.peers.push(Peer::new(SERVER_ID, link.server_name.clone(), "Connected to host"));
+            self.peers.push(Peer::new(SERVER_ID, link.server_name.clone()));
             self.link = Link::Client(link);
         }
 
         self.name = name;
         self.is_host = is_host;
-        self.color = color_of(self.wizard.color);
         self.selected = 0;
         self.wizard.error = None;
         self.screen = Screen::Chat;
@@ -685,12 +700,25 @@ impl App {
         self.wizard.error = Some(msg);
     }
 
-    // ── input ──
-
     fn handle_key(&mut self, key: KeyEvent) {
         match self.screen {
             Screen::Wizard => self.handle_wizard_key(key),
             Screen::Chat => self.handle_chat_key(key),
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.screen != Screen::Chat {
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let (mx, my) = (mouse.column, mouse.row);
+            for (i, (_id, r)) in self.last_peer_rects.iter().enumerate() {
+                if mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height {
+                    self.select(i);
+                    break;
+                }
+            }
         }
     }
 
@@ -701,14 +729,12 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Esc => self.should_quit = true,
-            KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 4,
-            KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 3) % 4,
+            KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 3,
+            KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 2) % 3,
             KeyCode::Left | KeyCode::Right if w.field == 0 => {
                 w.mode = if w.mode == Mode::Host { Mode::Join } else { Mode::Host };
                 w.addr = if w.mode == Mode::Host { "8001" } else { "127.0.0.1:8001" }.to_string();
             }
-            KeyCode::Left if w.field == 3 => w.color = (w.color + 3) % 4,
-            KeyCode::Right if w.field == 3 => w.color = (w.color + 1) % 4,
             KeyCode::Enter => {
                 if let Err(e) = self.start_session() {
                     self.wizard.error = Some(e);
@@ -720,12 +746,8 @@ impl App {
                 _ => {}
             },
             KeyCode::Backspace => match w.field {
-                1 => {
-                    w.name.pop();
-                }
-                2 => {
-                    w.addr.pop();
-                }
+                1 => { w.name.pop(); }
+                2 => { w.addr.pop(); }
                 _ => {}
             },
             _ => {}
@@ -778,7 +800,6 @@ impl App {
         }
     }
 
-    /// Nudge the selected node by whole terminal cells.
     fn move_selected(&mut self, dcol: i32, drow: i32) {
         let n = self.peers.len();
         if n == 0 {
@@ -836,8 +857,6 @@ impl App {
         self.input.clear();
     }
 
-    // ── network + animation ──
-
     fn poll_network(&mut self) {
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
@@ -846,7 +865,7 @@ impl App {
                         continue;
                     }
                     self.set_status(format!("{name} joined"));
-                    self.peers.push(Peer::new(id, name, "Joined the room"));
+                    self.peers.push(Peer::new(id, name));
                 }
                 NetEvent::PeerLeft { id } => {
                     if let Some(idx) = self.peers.iter().position(|p| p.id == id) {
@@ -876,8 +895,6 @@ impl App {
         for f in &mut self.flights {
             f.t += dt;
         }
-        // Commit finished flights to the log, but never let a message overtake an
-        // earlier unfinished one for the same peer (keeps the log in order).
         let mut blocked: Vec<u32> = Vec::new();
         let mut i = 0;
         while i < self.flights.len() {
@@ -901,7 +918,9 @@ impl App {
             if f.incoming && selected_id != Some(p.id) {
                 p.unread += 1;
             }
-            p.log.push(LogEntry { kind: if f.incoming { Kind::In } else { Kind::Out }, text: f.full });
+            let kind = if f.incoming { Kind::In } else { Kind::Out };
+            save_history_entry(&p.name, kind, &f.full);
+            p.log.push(LogEntry { kind, text: f.full });
             if p.log.len() > MAX_LOG {
                 p.log.remove(0);
             }
@@ -910,11 +929,6 @@ impl App {
 }
 
 // ───────────────────────────── geometry ─────────────────────────────
-//
-// All graph geometry is computed in *cell space*: (col,row) relative to the top-left
-// of the canvas' inner area, row growing downwards. Nodes are whole cells, and the
-// link endpoints are computed against those exact cells. Only at the very end are
-// points converted into ratatui Canvas coordinates (see `CanvasMap`).
 
 type Pt = (f64, f64);
 
@@ -957,7 +971,6 @@ fn rect_center(r: Rect, inner: Rect) -> Pt {
     )
 }
 
-/// Where the ray from `center` towards `target` leaves a box with the given half-extents.
 fn edge_point(center: Pt, half: Pt, target: Pt) -> Pt {
     let (dx, dy) = (target.0 - center.0, target.1 - center.1);
     if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
@@ -969,9 +982,6 @@ fn edge_point(center: Pt, half: Pt, target: Pt) -> Pt {
     (center.0 + dx * s, center.1 + dy * s)
 }
 
-/// The two end points of the link between two nodes. They sit on the centre line of
-/// the *border cells*, so the line runs right up to the visible frame of each node
-/// (the part inside the node is hidden by the node itself).
 fn link_segment(a: Rect, b: Rect, inner: Rect) -> Option<(Pt, Pt)> {
     if a.intersects(b) {
         return None;
@@ -981,9 +991,6 @@ fn link_segment(a: Rect, b: Rect, inner: Rect) -> Option<(Pt, Pt)> {
     Some((edge_point(ca, half(a), cb), edge_point(cb, half(b), ca)))
 }
 
-/// Maps cell-space points to Canvas coordinates such that one cell is *exactly*
-/// 2 braille dots wide and 4 dots tall. (ratatui maps `x` to dot `x*(2W-1)/width`,
-/// so choosing width = W-0.5 and height = H-0.25 makes the factor exactly 2 and 4.)
 struct CanvasMap {
     w: f64,
     h: f64,
@@ -999,25 +1006,15 @@ impl CanvasMap {
     fn y_bounds(&self) -> [f64; 2] {
         [0.0, self.h - 0.25]
     }
-    /// Note: ratatui drops a `Line` completely if an endpoint is out of bounds, so clamp.
     fn pt(&self, p: Pt) -> Pt {
         let top = self.h - 0.25;
         (p.0.clamp(0.0, self.w - 0.5), top - p.1.clamp(0.0, top))
     }
 }
 
-/// Place the log bubble next to a node, hiding as little as possible. Each side is tried
-/// at full size and then progressively smaller; every candidate is scored by what it would
-/// cover (the node itself >> you >> other nodes) plus a small penalty for shrinking. Ties go
-/// to the side facing away from "you", which keeps the bubble off the links.
 fn place_bubble(node_idx: usize, size: (u16, u16), inner: Rect, local: Rect, nodes: &[Rect]) -> Rect {
     #[derive(Clone, Copy, PartialEq)]
-    enum Side {
-        Below,
-        Above,
-        Right,
-        Left,
-    }
+    enum Side { Below, Above, Right, Left }
     let node = nodes[node_idx];
     let (min_w, min_h) = (22.min(size.0), 4.min(size.1));
     let (ix0, iy0) = (inner.x as i32, inner.y as i32);
@@ -1049,7 +1046,7 @@ fn place_bubble(node_idx: usize, size: (u16, u16), inner: Rect, local: Rect, nod
                 Side::Left => (nx - bw, cy),
             };
             if x < ix0 || y < iy0 || x + bw > ix1 || y + bh > iy1 {
-                continue; // does not fit on this side at this size
+                continue;
             }
             let r = Rect::new(x as u16, y as u16, w, hgt);
             let mut score = overlap(r, node) * 10 + overlap(r, local) * 4 + (full - r.area()) / 6;
@@ -1092,7 +1089,6 @@ fn draw_wizard(f: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
-        Constraint::Length(3),
         Constraint::Min(2),
     ])
     .margin(3)
@@ -1102,7 +1098,7 @@ fn draw_wizard(f: &mut Frame, app: &App) {
         Block::default()
             .title(" P2P Room Setup ")
             .borders(Borders::ALL)
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(Color::Gray)),
         area,
     );
 
@@ -1120,15 +1116,6 @@ fn draw_wizard(f: &mut Frame, app: &App) {
     let label = if w.mode == Mode::Host { "Listen Port" } else { "Server Address (IP:Port)" };
     field(f, layout[2], format!(" {label}: {}_", w.addr), 2);
 
-    let names = ["Cyan", "Green", "Magenta", "Yellow"];
-    let colors = names
-        .iter()
-        .enumerate()
-        .map(|(i, c)| if i == w.color { format!("*[{c}]*") } else { format!(" [{c}] ") })
-        .collect::<Vec<_>>()
-        .join(" ");
-    field(f, layout[3], format!(" Color: {colors}"), 3);
-
     let mut lines: Vec<TextLine> = Vec::new();
     if let Some(err) = &w.error {
         lines.push(TextLine::from(Span::styled(format!(" ! {err}"), Style::default().fg(Color::Red))));
@@ -1138,7 +1125,7 @@ fn draw_wizard(f: &mut Frame, app: &App) {
         lines.push(TextLine::from(""));
     }
     lines.push(TextLine::from(" [Tab/Up/Down] Navigate | [Left/Right] Toggle | [Enter] Start | [Esc] Quit"));
-    f.render_widget(Paragraph::new(lines), layout[4]);
+    f.render_widget(Paragraph::new(lines), layout[3]);
 }
 
 fn draw_chat(f: &mut Frame, app: &mut App) {
@@ -1159,6 +1146,9 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     app.free_range = geo.free;
     app.clamp_selection();
 
+    // Cache rects for mouse hit-testing
+    app.last_peer_rects = app.peers.iter().zip(&geo.peers).map(|(p, r)| (p.id, *r)).collect();
+
     let role = if app.is_host { "HOST" } else { "CLIENT" };
     f.render_widget(
         Block::default()
@@ -1169,11 +1159,10 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
                 app.peers.len()
             ))
             .borders(Borders::ALL)
-            .style(Style::default().fg(app.color)),
+            .style(Style::default().fg(Color::Gray)),
         canvas_area,
     );
 
-    // ── links (canvas) ──
     let segs: Vec<Option<(Pt, Pt)>> = geo.peers.iter().map(|r| link_segment(geo.local, *r, inner)).collect();
     let map = CanvasMap::new(inner);
     let links: Vec<(Pt, Pt, bool)> = segs
@@ -1186,7 +1175,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         .x_bounds(map.x_bounds())
         .y_bounds(map.y_bounds())
         .paint(move |ctx| {
-            // Selected link last so it is drawn on top where links cross.
             for selected in [false, true] {
                 for (a, b, sel) in links.iter().filter(|l| l.2 == selected) {
                     let color = if *sel { Color::Yellow } else { Color::DarkGray };
@@ -1196,12 +1184,11 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         });
     f.render_widget(canvas, inner);
 
-    // ── flying words (drawn on exact cells, along the same link) ──
     for fl in &app.flights {
         let Some(idx) = app.peers.iter().position(|p| p.id == fl.peer_id) else { continue };
         let Some((a, b)) = segs[idx] else { continue };
         let (from, to) = if fl.incoming { (b, a) } else { (a, b) };
-        let color = if fl.incoming { Color::Green } else { Color::Yellow };
+        let color = if fl.incoming { Color::Gray } else { Color::Yellow };
         for (i, word) in fl.words.iter().enumerate() {
             let s = ((fl.t - i as f32 * WORD_STAGGER) / WORD_FLIGHT) as f64;
             if !(0.0..1.0).contains(&s) {
@@ -1218,7 +1205,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         }
     }
 
-    // ── nodes ──
     let draw_node = |f: &mut Frame, rect: Rect, title: &str, body: Vec<TextLine>, color: Color| {
         f.render_widget(Clear, rect);
         let block = Block::default()
@@ -1233,10 +1219,10 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         geo.local,
         &format!("{} (You)", app.name),
         vec![TextLine::from(format!("Role: {role}")), TextLine::from("Status: Online")],
-        app.color,
+        Color::Gray,
     );
     for (i, peer) in app.peers.iter().enumerate() {
-        let color = if i == app.selected { Color::Yellow } else { Color::Green };
+        let color = if i == app.selected { Color::Yellow } else { Color::DarkGray };
         let msgs = if peer.unread > 0 {
             format!("Msgs: {} (+{})", peer.total, peer.unread)
         } else {
@@ -1246,7 +1232,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         draw_node(f, geo.peers[i], &peer.name, vec![TextLine::from(role), TextLine::from(msgs)], color);
     }
 
-    // ── log bubble for the selected node ──
     if let Some(peer) = app.peers.get(app.selected) {
         let size = (36u16.min(inner.width), 7u16.min(inner.height));
         let rect = place_bubble(app.selected, size, inner, geo.local, &geo.peers);
@@ -1260,7 +1245,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         let mut rows: Vec<(Color, String)> = Vec::new();
         let mut push = |kind: Kind, text: String| {
             let color = match kind {
-                Kind::In => Color::Green,
+                Kind::In => Color::Gray,
                 Kind::Out => Color::Yellow,
                 Kind::Sys => Color::DarkGray,
             };
@@ -1292,7 +1277,6 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
-    // ── input + status ──
     let broadcast = app.input.starts_with("/all ");
     let target = if broadcast {
         "Everyone".to_string()
@@ -1310,7 +1294,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
             Block::default()
                 .title(" Message Input ")
                 .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Green)),
+                .style(Style::default().fg(Color::Yellow)),
         ),
         input_area,
     );
@@ -1320,7 +1304,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
             Span::styled(format!(" {msg}"), Style::default().fg(Color::Yellow))
         }
         _ => Span::styled(
-            " Tab: select | Alt+Arrows: move node | /all <msg>: everyone | Esc: quit",
+            " Tab/Click: select | Alt+Arrows: move node | /all <msg>: everyone | Esc: quit",
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -1334,17 +1318,16 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
     }
 }
 
-/// If the UI thread panics, restore the terminal first so the message is readable.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if thread::current().name() == Some("main") {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
         }
         default_hook(info);
     }));
@@ -1354,8 +1337,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let _guard = TerminalGuard; // restores the terminal on every exit path, even `?`
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     terminal.clear()?;
 
@@ -1366,12 +1349,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(33))? {
-            // Drain everything that is pending so a burst of keys / a paste is handled in one frame.
             loop {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Release {
-                        app.handle_key(key);
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Release {
+                            app.handle_key(key);
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                    }
+                    _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
@@ -1379,7 +1367,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Animations are time-based, so typing fast no longer makes them run faster.
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.25);
         last = now;
@@ -1389,173 +1376,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-// ───────────────────────────── tests ─────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::backend::TestBackend;
-
-    fn recv(rx: &Receiver<NetEvent>) -> NetEvent {
-        rx.recv_timeout(Duration::from_secs(3)).expect("expected a network event")
-    }
-
-    #[test]
-    fn room_end_to_end() {
-        let (host_tx, host_rx) = mpsc::channel();
-        let host = start_host("127.0.0.1:0", "Host".into(), host_tx).unwrap();
-        let addr = host.local_addr.to_string();
-
-        let (a_tx, a_rx) = mpsc::channel();
-        let alice = connect_client(&addr, "Alice", a_tx).unwrap();
-        assert_eq!(alice.server_name, "Host");
-        assert!(matches!(recv(&host_rx), NetEvent::PeerJoined { name, .. } if name == "Alice"));
-
-        let (b_tx, b_rx) = mpsc::channel();
-        let bob = connect_client(&addr, "Bob", b_tx).unwrap();
-        assert!(matches!(recv(&host_rx), NetEvent::PeerJoined { name, .. } if name == "Bob"));
-        // Bob is told about Alice, Alice is told about Bob (ids survive ':' in addresses).
-        assert!(matches!(recv(&b_rx), NetEvent::PeerJoined { id, name } if id == alice.my_id && name == "Alice"));
-        assert!(matches!(recv(&a_rx), NetEvent::PeerJoined { id, name } if id == bob.my_id && name == "Bob"));
-
-        // Client -> client relay (text may contain ':' and spaces).
-        alice.tx.send(format!("MSG\t{}\tnote: 10:30 works", bob.my_id)).unwrap();
-        assert!(matches!(recv(&b_rx), NetEvent::Message { from, text } if from == alice.my_id && text == "note: 10:30 works"));
-
-        // Client -> host and host -> client.
-        bob.tx.send(format!("MSG\t{SERVER_ID}\thi host")).unwrap();
-        assert!(matches!(recv(&host_rx), NetEvent::Message { from, text } if from == bob.my_id && text == "hi host"));
-        assert!(host.send(bob.my_id, "hi bob"));
-        assert!(matches!(recv(&b_rx), NetEvent::Message { from: SERVER_ID, text } if text == "hi bob"));
-
-        // Broadcast from Bob reaches Alice and the host, but not Bob.
-        bob.tx.send(format!("MSG\t{BROADCAST_ID}\tevery one")).unwrap();
-        assert!(matches!(recv(&a_rx), NetEvent::Message { from, .. } if from == bob.my_id));
-        assert!(matches!(recv(&host_rx), NetEvent::Message { from, .. } if from == bob.my_id));
-
-        // Leaving is announced.
-        let bob_id = bob.my_id;
-        drop(bob);
-        assert!(matches!(recv(&a_rx), NetEvent::PeerLeft { id } if id == bob_id));
-        assert!(matches!(recv(&host_rx), NetEvent::PeerLeft { id } if id == bob_id));
-    }
-
-    #[test]
-    fn full_room_and_garbage_are_rejected_cleanly() {
-        let (host_tx, _host_rx) = mpsc::channel();
-        let host = start_host("127.0.0.1:0", "Host".into(), host_tx).unwrap();
-        let addr = host.local_addr.to_string();
-
-        let mut keep = Vec::new();
-        for i in 0..MAX_PEERS {
-            let (tx, rx) = mpsc::channel();
-            keep.push((connect_client(&addr, &format!("P{i}"), tx).unwrap(), rx));
-        }
-        let (tx, _rx) = mpsc::channel();
-        let err = connect_client(&addr, "TooMany", tx).err().expect("room should be full");
-        assert!(err.contains("full"), "{err}");
-
-        // A non-protocol peer must not hang or crash the host.
-        let mut s = TcpStream::connect(&addr).unwrap();
-        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
-        let mut buf = [0u8; 16];
-        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        assert_eq!(s.read(&mut buf).unwrap_or(0), 0); // closed without reply
-    }
-
-    #[test]
-    fn edge_point_hits_box_boundary() {
-        // 20x4 box centred at (10, 2): leaving to the right hits x = 10 + 10.
-        let p = edge_point((10.0, 2.0), (10.0, 2.0), (50.0, 2.0));
-        assert!((p.0 - 20.0).abs() < 1e-9 && (p.1 - 2.0).abs() < 1e-9);
-        // Steep direction leaves through the bottom edge.
-        let p = edge_point((10.0, 2.0), (10.0, 2.0), (12.0, 40.0));
-        assert!((p.1 - 4.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn links_touch_the_node_frames() {
-        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.name = "Me".into();
-        for i in 1..=5 {
-            app.peers.push(Peer::new(i, format!("P{i}"), "joined"));
-        }
-        app.peers[2].manual = Some((0.3, 0.9)); // a manually moved node too
-        term.draw(|f| ui(f, &mut app)).unwrap();
-        let buf = term.backend().buffer().clone();
-
-        let (_, inner, _, _) = split_chat(Rect::new(0, 0, 100, 30));
-        let geo = geometry(inner, &app.peers);
-        let is_dot = |x: u16, y: u16| {
-            let c = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
-            ('\u{2801}'..='\u{28FF}').contains(&c)
-        };
-        // For every node, count braille cells in the one-cell ring around it.
-        let ring_dots = |r: Rect| -> usize {
-            let mut n = 0;
-            for y in r.y.saturating_sub(1)..=(r.bottom()).min(29) {
-                for x in r.x.saturating_sub(1)..=(r.right()).min(99) {
-                    let on_ring = x + 1 == r.x || x == r.right() || y + 1 == r.y || y == r.bottom();
-                    if on_ring && is_dot(x, y) {
-                        n += 1;
-                    }
-                }
-            }
-            n
-        };
-        for (i, r) in geo.peers.iter().enumerate() {
-            assert!(ring_dots(*r) >= 1, "link to peer {i} does not reach its node at {r:?}");
-        }
-        assert!(ring_dots(geo.local) >= app.peers.len(), "links must start at the local node frame");
-    }
-
-    #[test]
-    fn tiny_terminal_does_not_panic() {
-        for (w, h) in [(10, 5), (71, 19), (72, 20), (200, 8), (72, 200)] {
-            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-            let mut app = App::new();
-            app.screen = Screen::Chat;
-            app.peers.push(Peer::new(1, "A".into(), "x"));
-            app.selected = 7; // stale index must be tolerated
-            term.draw(|f| ui(f, &mut app)).unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-mod preview {
-    use super::*;
-    use ratatui::backend::TestBackend;
-    fn show(title: &str, w: u16, h: u16, app: &mut App) {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| ui(f, app)).unwrap();
-        let buf = term.backend().buffer().clone();
-        println!("\n===== {title} ({w}x{h}) =====");
-        for y in 0..h { let mut s = String::new(); for x in 0..w { s.push_str(buf[(x,y)].symbol()); } println!("{}", s.trim_end()); }
-    }
-    #[test]
-    fn dump() {
-        let mut app = App::new(); app.screen = Screen::Chat; app.name = "Me".into(); app.is_host = true;
-        app.room_info = "friends join: 192.168.1.5:8001".into();
-        for (i, n) in ["Alice", "Bob", "Carol"].iter().enumerate() { app.peers.push(Peer::new(i as u32 + 1, n.to_string(), "Joined the room")); }
-        let mut f1 = Flight::new(1, "hello there how are you".into(), false); f1.t = 0.55;
-        let mut f2 = Flight::new(2, "incoming from bob".into(), true); f2.t = 0.45;
-        app.flights.push(f1); app.flights.push(f2);
-        show("80x24, 3 peers, flights", 80, 24, &mut app);
-
-        let mut app = App::new(); app.screen = Screen::Chat; app.name = "Me".into(); app.is_host = true;
-        for i in 1..=5 { app.peers.push(Peer::new(i, format!("P{i}"), "joined")); }
-        app.selected = 3;
-        app.peers[3].log.push(LogEntry{kind: Kind::In, text: "a fairly long message that must wrap inside the bubble nicely".into()});
-        show("100x30, 5 peers, sel=3", 100, 30, &mut app);
-
-        let mut app = App::new(); app.screen = Screen::Chat; app.name = "Me".into(); app.is_host = true;
-        for i in 1..=8 { app.peers.push(Peer::new(i, format!("Player{i}"), "joined")); }
-        app.selected = 5;
-        show("120x36, 8 peers, sel=5", 120, 36, &mut app);
-    }
 }
