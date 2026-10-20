@@ -14,7 +14,17 @@ use ratatui::{
     },
     Terminal,
 };
-use std::{io, time::Duration};
+use std::{
+    env,
+    io::{self, BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
 
 struct Peer {
     name: String,
@@ -27,6 +37,11 @@ struct FlightAnimation {
     target_peer: usize,
     words: Vec<String>,
     progress: f32, // 0.0 to 1.0+
+    is_incoming: bool,
+}
+
+enum NetworkEvent {
+    IncomingMessage(String),
 }
 
 struct App {
@@ -35,35 +50,53 @@ struct App {
     selected_peer: usize,
     input_buffer: String,
     animations: Vec<FlightAnimation>,
+    tx_stream: Option<Arc<Mutex<TcpStream>>>,
+    network_rx: Receiver<NetworkEvent>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(tx_stream: Option<TcpStream>, network_rx: Receiver<NetworkEvent>, node_title: String) -> Self {
+        let stream_arc = tx_stream.map(|s| Arc::new(Mutex::new(s)));
         Self {
             should_quit: false,
             peers: vec![
                 Peer {
-                    name: "Node-Alpha (You)".to_string(),
+                    name: format!("Node-Local ({})", node_title),
                     x_ratio: 0.15,
                     y_ratio: 0.25,
-                    messages: vec!["Local node initialized.".to_string()],
+                    messages: vec!["Local node online & listening.".to_string()],
                 },
                 Peer {
-                    name: "Node-Beta (Peer 1)".to_string(),
-                    x_ratio: 0.50,
-                    y_ratio: 0.60,
-                    messages: vec!["Connected to network.".to_string()],
-                },
-                Peer {
-                    name: "Node-Gamma (Peer 2)".to_string(),
-                    x_ratio: 0.75,
-                    y_ratio: 0.30,
-                    messages: vec!["Syncing block headers...".to_string()],
+                    name: "Node-Remote Peer".to_string(),
+                    x_ratio: 0.70,
+                    y_ratio: 0.50,
+                    messages: vec!["Waiting for peer stream...".to_string()],
                 },
             ],
             selected_peer: 1,
             input_buffer: String::new(),
             animations: Vec::new(),
+            tx_stream: stream_arc,
+            network_rx,
+        }
+    }
+
+    fn poll_network(&mut self) {
+        while let Ok(event) = self.network_rx.try_recv() {
+            match event {
+                NetworkEvent::IncomingMessage(text) => {
+                    let words: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
+                    if !words.is_empty() {
+                        // Spawn an incoming animation traveling from remote peer to local node
+                        self.animations.push(FlightAnimation {
+                            target_peer: 1, // Remote peer index
+                            words,
+                            progress: 0.0,
+                            is_incoming: true,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -98,18 +131,24 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.input_buffer.trim().is_empty() {
-                    let words: Vec<String> = self
-                        .input_buffer
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let text = self.input_buffer.trim().to_string();
+                    let words: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
 
                     if !words.is_empty() {
+                        // Spawn outgoing animation
                         self.animations.push(FlightAnimation {
                             target_peer: self.selected_peer,
                             words,
                             progress: 0.0,
+                            is_incoming: false,
                         });
+
+                        // Send actual bytes over TCP stream if connected
+                        if let Some(stream_arc) = &self.tx_stream {
+                            if let Ok(mut stream) = stream_arc.lock() {
+                                let _ = writeln!(stream, "{}", text);
+                            }
+                        }
                     }
                     self.input_buffer.clear();
                 }
@@ -129,23 +168,70 @@ impl App {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse CLI arguments for local P2P port binding
+    // Usage: cargo run -- <listen_port> <target_port>
+    let args: Vec<String> = env::args().collect();
+    let listen_port = args.get(1).unwrap_or(&"8001".to_string()).clone();
+    let target_port = args.get(2).unwrap_or(&"8002".to_string()).clone();
+
+    let node_title = format!("Port: {}", listen_port);
+
+    // Setup TCP Networking Channels
+    let (net_tx, net_rx) = mpsc::channel();
+    let listen_addr = format!("127.0.0.1:{}", listen_port);
+    let target_addr = format!("127.0.0.1:{}", target_port);
+
+    // Background Thread: TCP Listener for incoming connections
+    let listener = TcpListener::bind(&listen_addr)?;
+    listener.set_nonblocking(false)?;
+
+    let net_tx_clone = net_tx.clone();
+    thread::spawn(move || {
+        for stream_result in listener.incoming() {
+            if let Ok(stream) = stream_result {
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    if let Ok(msg) = line {
+                        let _ = net_tx_clone.send(NetworkEvent::IncomingMessage(msg));
+                    }
+                }
+            }
+        }
+    });
+
+    // Background Thread / Attempt: Connect to target peer TCP stream
+    let tx_stream = loop {
+        match TcpStream::connect(&target_addr) {
+            Ok(stream) => break Some(stream),
+            Err(_) => {
+                // Retry connection silently until peer terminal is opened
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+
+    // Setup Terminal UI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(tx_stream, net_rx, node_title);
 
     while !app.should_quit {
-        // Tick active flight animations smoothly, factoring in word count for duration
+        // Poll incoming network events
+        app.poll_network();
+
+        // Tick active flight animations smoothly
         app.animations.retain_mut(|anim| {
-            anim.progress += 0.010;
-            // Complete animation once the last word has fully arrived
-            let completion_threshold = 0.5 + (anim.words.len() as f32 * 0.12);
+            anim.progress += 0.02;
+            let completion_threshold = 1.0 + (anim.words.len() as f32 * 0.12);
             if anim.progress >= completion_threshold {
-                let full_msg = format!("Out: {} ✓", anim.words.join(" "));
-                app.peers[anim.target_peer].messages.push(full_msg);
+                let prefix = if anim.is_incoming { "In: " } else { "Out: " };
+                let clean_msg = format!("{}{} ✓", prefix, anim.words.join(" "));
+                let target = anim.target_peer;
+                app.peers[target].messages.push(clean_msg);
                 false
             } else {
                 true
@@ -163,8 +249,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let canvas_area = vertical_chunks[0];
             let input_area = vertical_chunks[1];
 
+            let canvas_title_str = format!(
+                " P2P Chat Node [Listening: {} | Target: {} | Ctrl+Arrows: Move | Enter: Send] ",
+                listen_port, target_port
+            );
             let canvas_block = Block::default()
-                .title(" P2P Network Graph [Tab: Switch Peer | Ctrl+Arrows: Move Node | Enter: Send | Esc: Quit] ")
+                .title(canvas_title_str)
                 .borders(Borders::ALL)
                 .style(Style::default().fg(Color::Cyan));
 
@@ -200,10 +290,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let active_target = app.selected_peer;
             
             let canvas_node_positions = node_positions.clone();
-            let canvas_animations: Vec<(usize, Vec<String>, f32)> = app
+            let canvas_animations: Vec<(usize, Vec<String>, f32, bool)> = app
                 .animations
                 .iter()
-                .map(|a| (a.target_peer, a.words.clone(), a.progress))
+                .map(|a| (a.target_peer, a.words.clone(), a.progress, a.is_incoming))
                 .collect();
             let total_peers = app.peers.len();
 
@@ -231,13 +321,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
 
-                    // Draw flying text words sequentially word-by-word along path
-                    for (target_peer, words, progress) in &canvas_animations {
+                    // Draw flying text words along active flight paths (Outgoing & Incoming)
+                    for (target_peer, words, progress, is_incoming) in &canvas_animations {
                         let peer_center = (canvas_node_positions[*target_peer].2, canvas_node_positions[*target_peer].3);
-                        let x1 = local_center.0 as f64;
-                        let y1 = (canvas_height - local_center.1) as f64;
-                        let x2 = peer_center.0 as f64;
-                        let y2 = (canvas_height - peer_center.1) as f64;
+                        
+                        let (start_x, start_y, end_x, end_y) = if *is_incoming {
+                            (peer_center.0 as f64, (canvas_height - peer_center.1) as f64, local_center.0 as f64, (canvas_height - local_center.1) as f64)
+                        } else {
+                            (local_center.0 as f64, (canvas_height - local_center.1) as f64, peer_center.0 as f64, (canvas_height - peer_center.1) as f64)
+                        };
 
                         for (i, word) in words.iter().enumerate() {
                             let word_span = 0.55;
@@ -245,11 +337,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let word_progress = ((progress - word_start) / word_span).clamp(0.0, 1.0);
 
                             if *progress >= word_start && word_progress < 1.0 {
-                                let current_x = x1 + (x2 - x1) * word_progress as f64;
-                                let current_y = y1 + (y2 - y1) * word_progress as f64;
+                                let current_x = start_x + (end_x - start_x) * word_progress as f64;
+                                let current_y = start_y + (end_y - start_y) * word_progress as f64;
 
                                 let display_msg = format!("📦 [{}]", word);
-                                let styled_line = TextLine::from(Span::styled(display_msg, Style::default().fg(Color::Yellow)));
+                                let color = if *is_incoming { Color::Green } else { Color::Yellow };
+                                let styled_line = TextLine::from(Span::styled(display_msg, Style::default().fg(color)));
                                 ctx.print(current_x, current_y, styled_line);
                             }
                         }
@@ -289,7 +382,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 f.render_widget(node_content, node_rect);
 
-                // Render Chat Bubble safely avoiding the connecting line trajectory
                 if is_target {
                     let chat_width = 34;
                     let chat_height = 7;
@@ -338,7 +430,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }).count();
                                 let partial_text = anim.words[..visible_word_count.min(anim.words.len())].join(" ");
                                 if !partial_text.is_empty() {
-                                    display_lines.push(format!("Out: {} ⏳", partial_text));
+                                    let tag = if anim.is_incoming { "In" } else { "Out" };
+                                    let icon = if anim.is_incoming { "📥" } else { "⏳" };
+                                    display_lines.push(format!("{}: {} {}", tag, partial_text, icon));
                                 }
                             }
                         }
