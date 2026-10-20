@@ -26,7 +26,7 @@ struct Peer {
 struct FlightAnimation {
     target_peer: usize,
     words: Vec<String>,
-    progress: f32, // 0.0 to 1.0
+    progress: f32, // 0.0 to 1.0+
 }
 
 struct App {
@@ -68,7 +68,6 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        // If Ctrl is held, move the currently targeted peer node position
         if modifiers.contains(KeyModifiers::CONTROL) {
             let step = 0.03;
             let peer = &mut self.peers[self.selected_peer];
@@ -90,7 +89,6 @@ impl App {
             return;
         }
 
-        // Standard key controls
         match key {
             KeyCode::Tab => {
                 self.selected_peer += 1;
@@ -140,10 +138,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
 
     while !app.should_quit {
-        // Tick active flight animations smoothly (slower speed at 0.025)
+        // Tick active flight animations smoothly, factoring in word count for duration
         app.animations.retain_mut(|anim| {
-            anim.progress += 0.025;
-            if anim.progress >= 1.0 {
+            anim.progress += 0.010;
+            // Complete animation once the last word has fully arrived
+            let completion_threshold = 0.5 + (anim.words.len() as f32 * 0.12);
+            if anim.progress >= completion_threshold {
                 let full_msg = format!("Out: {} ✓", anim.words.join(" "));
                 app.peers[anim.target_peer].messages.push(full_msg);
                 false
@@ -155,7 +155,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| {
             let area = f.area();
 
-            // Split screen vertically: Graph canvas on top, chat input at bottom
             let vertical_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(10), Constraint::Length(3)])
@@ -164,7 +163,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let canvas_area = vertical_chunks[0];
             let input_area = vertical_chunks[1];
 
-            // Canvas border block with updated instructions
             let canvas_block = Block::default()
                 .title(" P2P Network Graph [Tab: Switch Peer | Ctrl+Arrows: Move Node | Enter: Send | Esc: Quit] ")
                 .borders(Borders::ALL)
@@ -172,7 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             f.render_widget(canvas_block, canvas_area);
 
-            // Compute node screen positions
             let node_width = 24u16;
             let node_height = 5u16;
 
@@ -194,7 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let local_center = (node_positions[0].2, node_positions[0].3);
 
-            // 2. Render Lines and Traveling Text Words via Canvas
             let inner_canvas_area = canvas_area.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 1,
@@ -235,7 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
 
-                    // Draw flying text words along active flight paths
+                    // Draw flying text words sequentially word-by-word along path
                     for (target_peer, words, progress) in &canvas_animations {
                         let peer_center = (canvas_node_positions[*target_peer].2, canvas_node_positions[*target_peer].3);
                         let x1 = local_center.0 as f64;
@@ -243,12 +239,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let x2 = peer_center.0 as f64;
                         let y2 = (canvas_height - peer_center.1) as f64;
 
-                        let current_x = x1 + (x2 - x1) * *progress as f64;
-                        let current_y = y1 + (y2 - y1) * *progress as f64;
+                        for (i, word) in words.iter().enumerate() {
+                            let word_span = 0.55;
+                            let word_start = i as f32 * 0.12;
+                            let word_progress = ((progress - word_start) / word_span).clamp(0.0, 1.0);
 
-                        let display_msg = format!("📦 [{}]", words.join(" "));
-                        let styled_line = TextLine::from(Span::styled(display_msg, Style::default().fg(Color::Yellow)));
-                        ctx.print(current_x, current_y, styled_line);
+                            if *progress >= word_start && word_progress < 1.0 {
+                                let current_x = x1 + (x2 - x1) * word_progress as f64;
+                                let current_y = y1 + (y2 - y1) * word_progress as f64;
+
+                                let display_msg = format!("📦 [{}]", word);
+                                let styled_line = TextLine::from(Span::styled(display_msg, Style::default().fg(Color::Yellow)));
+                                ctx.print(current_x, current_y, styled_line);
+                            }
+                        }
                     }
                 });
 
@@ -328,9 +332,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         for anim in &app.animations {
                             if anim.target_peer == i {
-                                let visible_word_count = ((anim.words.len() as f32) * anim.progress).ceil() as usize;
+                                let visible_word_count = anim.words.iter().enumerate().filter(|(idx, _)| {
+                                    let word_start = *idx as f32 * 0.12;
+                                    anim.progress >= word_start
+                                }).count();
                                 let partial_text = anim.words[..visible_word_count.min(anim.words.len())].join(" ");
-                                display_lines.push(format!("Out: {} ⏳", partial_text));
+                                if !partial_text.is_empty() {
+                                    display_lines.push(format!("Out: {} ⏳", partial_text));
+                                }
                             }
                         }
 
