@@ -53,7 +53,7 @@ const WORD_STAGGER: f32 = 0.15;
 const WORD_FLIGHT: f32 = 0.9;
 const MAX_FLYING_WORDS: usize = 6;
 
-const DB_FILE: &str = "p2p_chat_history.db";
+const DB_FILE: &str = "database.db";
 
 // ───────────────────────────── small helpers ─────────────────────────────
 
@@ -168,14 +168,15 @@ fn lan_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-fn generate_crypto_avatar(uuid: &str) -> String {
+fn generate_crypto_avatar(uuid: &str) -> (char, String) {
     let mut hash: u32 = 0;
     for b in uuid.bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(b as u32);
     }
     let shapes = ['■', '▲', '◆', '●', '★', '◈', '◢', '▰'];
     let shape = shapes[(hash as usize) % shapes.len()];
-    format!("[{}{:04X}]", shape, hash & 0xFFFF)
+    let hex = format!("{:04X}", hash & 0xFFFF);
+    (shape, hex)
 }
 
 // ───────────────────────────── persistence (SQLite) ─────────────────────────────
@@ -196,16 +197,42 @@ fn init_db() -> rusqlite::Result<Connection> {
     let conn = Connection::open(DB_FILE)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS history (
+            peer_uuid TEXT,
             peer_name TEXT,
             kind TEXT,
             text TEXT
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )",
+        [],
+    )?;
     Ok(conn)
 }
 
-fn save_history_entry(peer_name: &str, kind: Kind, text: &str) {
+fn get_or_create_uuid() -> String {
+    if let Ok(conn) = init_db() {
+        if let Ok(mut stmt) = conn.prepare("SELECT value FROM config WHERE key = 'user_uuid'") {
+            let mut rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            if let Some(Ok(uuid)) = rows.next() {
+                return uuid;
+            }
+        }
+        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES ('user_uuid', ?1)",
+            params![new_uuid],
+        );
+        return new_uuid;
+    }
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn save_history_entry(peer_uuid: &str, peer_name: &str, kind: Kind, text: &str) {
     if let Ok(conn) = init_db() {
         let kind_str = match kind {
             Kind::In => "IN",
@@ -214,17 +241,17 @@ fn save_history_entry(peer_name: &str, kind: Kind, text: &str) {
         };
         let encrypted_text = encrypt_decrypt(text);
         let _ = conn.execute(
-            "INSERT INTO history (peer_name, kind, text) VALUES (?1, ?2, ?3)",
-            params![peer_name, kind_str, encrypted_text],
+            "INSERT INTO history (peer_uuid, peer_name, kind, text) VALUES (?1, ?2, ?3, ?4)",
+            params![peer_uuid, peer_name, kind_str, encrypted_text],
         );
     }
 }
 
-fn load_history_for(peer_name: &str) -> Vec<LogEntry> {
+fn load_history_for(peer_uuid: &str) -> Vec<LogEntry> {
     let mut logs = Vec::new();
     if let Ok(conn) = init_db() {
-        let mut stmt = conn.prepare("SELECT kind, text FROM history WHERE peer_name = ?1").unwrap();
-        let rows = stmt.query_map(params![peer_name], |row| {
+        let mut stmt = conn.prepare("SELECT kind, text FROM history WHERE peer_uuid = ?1").unwrap();
+        let rows = stmt.query_map(params![peer_uuid], |row| {
             let k_str: String = row.get(0)?;
             let enc_txt: String = row.get(1)?;
             Ok((k_str, encrypt_decrypt(&enc_txt)))
@@ -549,7 +576,7 @@ struct Peer {
 
 impl Peer {
     fn new(id: u32, name: String, uuid: String) -> Self {
-        let log = load_history_for(&name);
+        let log = load_history_for(&uuid);
         let total = log.iter().filter(|e| e.kind != Kind::Sys).count();
         Self {
             id,
@@ -647,7 +674,7 @@ fn auto_ratio(i: usize, n: usize, fx: f32, fy: f32) -> (f32, f32) {
 impl App {
     fn new() -> Self {
         let (ui_tx, ui_rx) = mpsc::channel();
-        let my_uuid = uuid::Uuid::new_v4().to_string();
+        let my_uuid = get_or_create_uuid();
         Self {
             screen: Screen::Wizard,
             wizard: Wizard {
@@ -721,7 +748,6 @@ impl App {
             self.room_info = format!("server: {target}");
             self.my_id = link.my_id;
             
-            // Extract fields before moving link into Link::Client to fix E0382
             let s_name = link.server_name.clone();
             let s_uuid = link.server_uuid.clone();
 
@@ -979,7 +1005,7 @@ impl App {
                 p.unread += 1;
             }
             let kind = if f.incoming { Kind::In } else { Kind::Out };
-            save_history_entry(&p.name, kind, &f.full);
+            save_history_entry(&p.uuid, &p.name, kind, &f.full);
             p.log.push(LogEntry { kind, text: f.full });
             if p.log.len() > MAX_LOG {
                 p.log.remove(0);
@@ -1172,9 +1198,9 @@ fn draw_wizard(f: &mut Frame, app: &App) {
     };
 
     let mode_str = if w.mode == Mode::Host { "[ Host Server ]" } else { "[ Join Server ]" };
-    let avatar_str = generate_crypto_avatar(&app.uuid);
+    let (shape, hex) = generate_crypto_avatar(&app.uuid);
     field(f, layout[0], format!(" Mode: {mode_str} (Left/Right to toggle)"), 0);
-    field(f, layout[1], format!(" Player Name: {}_  | Crypto ID: {avatar_str}", w.name), 1);
+    field(f, layout[1], format!(" Player Name: {}_  | Crypto ID: {shape} {hex}", w.name), 1);
     let label = if w.mode == Mode::Host { "Listen Port" } else { "Server Address (IP:Port)" };
     field(f, layout[2], format!(" {label}: {}_", w.addr), 2);
     field(f, layout[3], format!(" Optional Password: {}_", w.password), 3);
@@ -1212,12 +1238,12 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     app.last_peer_rects = app.peers.iter().zip(&geo.peers).map(|(p, r)| (p.id, *r)).collect();
 
     let role = if app.is_host { "HOST" } else { "CLIENT" };
+    let (my_shape, my_hex) = generate_crypto_avatar(&app.uuid);
     f.render_widget(
         Block::default()
             .title(format!(
-                " Room [{role}] {} ({}) | {} | Peers: {} ",
+                " Room [{role}] {} ({my_shape} {my_hex}) | {} | Peers: {} ",
                 app.name,
-                generate_crypto_avatar(&app.uuid),
                 app.room_info,
                 app.peers.len()
             ))
@@ -1268,39 +1294,84 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         }
     }
 
-    let draw_node = |f: &mut Frame, rect: Rect, title: &str, body: Vec<TextLine>, color: Color| {
+    // Draw node with icon on far-right border & hex in far-right 2x2 grid inside
+    let draw_node = |f: &mut Frame, rect: Rect, title: &str, line1: &str, uuid: &str, color: Color| {
         f.render_widget(Clear, rect);
+        let (shape, hex) = generate_crypto_avatar(uuid);
+        let c: Vec<char> = hex.chars().collect();
+        let c0 = *c.first().unwrap_or(&' ');
+        let c1 = *c.get(1).unwrap_or(&' ');
+        let c2 = *c.get(2).unwrap_or(&' ');
+        let c3 = *c.get(3).unwrap_or(&' ');
+
+        let title_str = format!(" {} ", truncate(title, (rect.width as usize).saturating_sub(6)));
+
         let block = Block::default()
-            .title(format!(" {} ", truncate(title, (rect.width as usize).saturating_sub(4))))
+            .title(title_str)
+            .title_alignment(ratatui::layout::Alignment::Left)
             .borders(Borders::ALL)
             .style(Style::default().fg(color));
-        f.render_widget(Paragraph::new(body).block(block), rect);
+
+        let inner_rect = block.inner(rect);
+        f.render_widget(block, rect);
+
+        // Render shape icon on far-right border
+        if rect.width >= 4 {
+            let icon_x = rect.right().saturating_sub(3);
+            f.render_widget(
+                Paragraph::new(Span::styled(shape.to_string(), Style::default().fg(color))),
+                Rect::new(icon_x, rect.y, 1, 1),
+            );
+        }
+
+        // Render inner body with far-right aligned 2x2 hex block
+        let avail_w = inner_rect.width as usize;
+        let left_w = avail_w.saturating_sub(3);
+        let pad1 = left_w.saturating_sub(text_width(line1));
+
+        let body_lines = vec![
+            TextLine::from(vec![
+                Span::raw(truncate(line1, left_w)),
+                Span::raw(" ".repeat(pad1)),
+                Span::styled(format!("{c0} {c1}"), Style::default().fg(color)),
+            ]),
+            TextLine::from(vec![
+                Span::raw(" ".repeat(left_w)),
+                Span::styled(format!("{c2} {c3}"), Style::default().fg(color)),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(body_lines), inner_rect);
     };
 
+    // Draw central "You" node
     draw_node(
         f,
         geo.local,
         &format!("{} (You)", app.name),
-        vec![TextLine::from(format!("Avatar: {}", generate_crypto_avatar(&app.uuid))), TextLine::from(format!("Role: {role}"))],
+        &format!("Role: {role}"),
+        &app.uuid,
         Color::Yellow,
     );
 
+    // Draw connected peer nodes
     for (i, peer) in app.peers.iter().enumerate() {
         let color = if i == app.selected { Color::Yellow } else { Color::DarkGray };
         let msgs = if peer.unread > 0 {
-            format!("Msgs: {} (+{})", peer.total, peer.unread)
+            format!("Msgs: {}+{}", peer.total, peer.unread)
         } else {
             format!("Msgs: {}", peer.total)
         };
-        draw_node(f, geo.peers[i], &peer.name, vec![TextLine::from(generate_crypto_avatar(&peer.uuid)), TextLine::from(msgs)], color);
+        draw_node(f, geo.peers[i], &peer.name, &msgs, &peer.uuid, color);
     }
 
     if let Some(peer) = app.peers.get(app.selected) {
         let size = (36u16.min(inner.width), 7u16.min(inner.height));
         let rect = place_bubble(app.selected, size, inner, geo.local, &geo.peers);
         f.render_widget(Clear, rect);
+        
+        let (p_shape, p_hex) = generate_crypto_avatar(&peer.uuid);
         let block = Block::default()
-            .title(format!(" Log: {} {} ", truncate(&peer.name, 12), generate_crypto_avatar(&peer.uuid)))
+            .title(format!(" Log: {} ({p_shape} {p_hex}) ", truncate(&peer.name, 12)))
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::Yellow));
         let (text_w, text_h) = (rect.width.saturating_sub(2) as usize, rect.height.saturating_sub(2) as usize);
