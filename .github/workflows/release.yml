@@ -38,7 +38,14 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          mv p2p* ${{ matrix.binary_name }}
+          bin=p2p
+          [ -f p2p.exe ] && bin=p2p.exe
+          if [ ! -f "$bin" ]; then
+            echo "Binary $bin not found in $(pwd):"
+            ls -la
+            exit 1
+          fi
+          mv -T "$bin" "${{ matrix.binary_name }}"
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
