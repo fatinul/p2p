@@ -3,53 +3,75 @@ name: Build Release Binaries
 on:
   push:
     tags:
-      - 'v*' # Triggers whenever you push a tag starting with 'v' (e.g., v1.0.0)
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: p2p_linux
+            bin: p2p
+            asset: p2p_linux
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: p2p.exe
+            bin: p2p.exe
+            asset: p2p.exe
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary_name: p2p_macos
+            bin: p2p
+            asset: p2p_macos
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build Release Binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Rename Binary for Artifact
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Prepare release asset
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          bin=p2p
-          [ -f p2p.exe ] && bin=p2p.exe
-          if [ ! -f "$bin" ]; then
-            echo "Binary $bin not found in $(pwd):"
-            ls -la
+          src="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if [ ! -f "$src" ]; then
+            echo "::error::Binary not found: $src"
+            echo "Contents of release directory:"
+            ls -la "target/${{ matrix.target }}/release"
             exit 1
           fi
-          mv -T "$bin" "${{ matrix.binary_name }}"
+          mkdir -p dist
+          cp "$src" "dist/${{ matrix.asset }}"
+          echo "Prepared release assets:"
+          ls -la dist
 
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v3
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/${{ matrix.asset }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
